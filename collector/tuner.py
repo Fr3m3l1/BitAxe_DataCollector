@@ -32,14 +32,18 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Flags recorded per operating point
+# Flags recorded per operating point. They expire so the tuner adapts when
+# conditions change: a point that was too hot at summer noon deserves another
+# chance on a cool night; real silicon instability is much less variable.
 UNSTABLE = "unstable"   # hashrate did not follow frequency
 THERMAL = "thermal"     # exceeded target temperature / power budget
+FLAG_TTL = {THERMAL: 12 * 3600, UNSTABLE: 7 * 24 * 3600}
 
 MIN_WINDOW_SAMPLES = 5
 EMERGENCY_INTERVAL = 60      # s between emergency downclock steps
 VERIFY_TIMEOUT = 45          # s to wait for a PATCH to take effect
 RESTART_SETTLE_EXTRA = 90    # extra settle time after a restart
+RETRY_AFTER = 12 * 3600      # s before a well-measured point may be re-explored
 
 
 class Tuner:
@@ -50,7 +54,7 @@ class Tuner:
         self.state_path = state_path
         self.config: dict = {"enabled": False}
 
-        self.history: dict[str, dict] = {}   # "freq:volt" -> {score, n, flags[]}
+        self.history: dict[str, dict] = {}   # "freq:volt" -> {score, n, flags{name:ts}, last}
         self.settle_until = 0.0
         self.window: list[dict] = []
         self.pending = None                   # {"freq","volt","deadline","restarted"}
@@ -65,7 +69,13 @@ class Tuner:
             data = json.loads(self.state_path.read_text())
             self.history = data.get("history", {})
         except (OSError, ValueError):
-            pass
+            return
+        # Migrate pre-expiry state files (flags as a list, no last-visit time).
+        now = time.time()
+        for entry in self.history.values():
+            if isinstance(entry.get("flags"), list):
+                entry["flags"] = {f: now for f in entry["flags"]}
+            entry.setdefault("last", now)
 
     def _save_state(self):
         try:
@@ -90,26 +100,44 @@ class Tuner:
     def _key(freq, volt) -> str:
         return f"{int(round(freq))}:{int(round(volt))}"
 
+    def _entry(self, freq, volt) -> dict:
+        return self.history.setdefault(
+            self._key(freq, volt), {"score": None, "n": 0, "flags": {}, "last": 0.0})
+
     def _flags(self, freq, volt) -> list:
-        return self.history.get(self._key(freq, volt), {}).get("flags", [])
+        """Flags that have not expired yet."""
+        flags = self.history.get(self._key(freq, volt), {}).get("flags", {})
+        now = time.time()
+        return [f for f, ts in flags.items() if now - ts < FLAG_TTL.get(f, 0)]
 
     def _mark(self, freq, volt, flag):
-        entry = self.history.setdefault(self._key(freq, volt), {"score": None, "n": 0, "flags": []})
-        if flag not in entry["flags"]:
-            entry["flags"].append(flag)
+        self._entry(freq, volt)["flags"][flag] = time.time()
 
     def _record_score(self, freq, volt, score):
-        entry = self.history.setdefault(self._key(freq, volt), {"score": None, "n": 0, "flags": []})
+        entry = self._entry(freq, volt)
         # Exponential moving average so re-visits refine the estimate.
         entry["score"] = score if entry["score"] is None else 0.6 * entry["score"] + 0.4 * score
         entry["n"] += 1
+        entry["last"] = time.time()
+
+    def _may_explore(self, freq, volt) -> bool:
+        """A candidate point is worth (re-)trying if it has no active flags and
+        is either barely measured or hasn't been visited for a while."""
+        if self._flags(freq, volt):
+            return False
+        entry = self.history.get(self._key(freq, volt))
+        if entry is None:
+            return True
+        return entry["n"] < 3 or time.time() - entry["last"] > RETRY_AFTER
 
     def _best_point(self):
         best = None
         for key, entry in self.history.items():
-            if entry["flags"] or entry["score"] is None:
+            if entry["score"] is None:
                 continue
             freq, volt = (int(x) for x in key.split(":"))
+            if self._flags(freq, volt):
+                continue
             c = self.config
             if not (c["freq_min"] <= freq <= c["freq_max"] and c["volt_min"] <= volt <= c["volt_max"]):
                 continue
@@ -293,7 +321,7 @@ class Tuner:
                 candidates.append((freq + step_f, volt, "thermal headroom — trying higher frequency"))
                 candidates.append((freq + step_f, volt + step_v, "trying higher frequency with more voltage"))
         for f, v, reason in candidates:
-            if clean(f, v) and self.history.get(self._key(f, v), {}).get("n", 0) < 3:
+            if in_range(f, v) and self._may_explore(f, v):
                 self._apply(f, v, "step", reason, metrics)
                 return
 
