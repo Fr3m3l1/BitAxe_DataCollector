@@ -1,15 +1,14 @@
-# Use a lightweight Python image
-FROM python:3.11-slim
+FROM python:3.13-slim
 
-# Set working directory
 WORKDIR /app
 
-# Copy requirements and install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy your Python code into the container
-COPY src/ /app
+COPY collector ./collector
+COPY run.py .
 
-# Run the Python script
-CMD ["python", "main.py"]
+ENV DATA_DIR=/data
+VOLUME /data
+
+CMD ["python", "run.py"]
